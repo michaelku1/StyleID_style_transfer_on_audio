@@ -1,0 +1,5 @@
+# inference
+python riffusion/styleid_inference.py \
+  --content_audio path/to/content.wav \
+  --style_audio path/to/style.wav \
+  --output_path path/to/output.wav
