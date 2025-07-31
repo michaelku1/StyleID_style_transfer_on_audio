@@ -401,6 +401,8 @@ class RiffusionPipeline(DiffusionPipeline):
             latent_model_input = (
                 torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             )
+
+            # scale with variance?
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
             # predict the noise residual

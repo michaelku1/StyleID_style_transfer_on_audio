@@ -1,6 +1,7 @@
 import numpy as np
 import pydub
 from PIL import Image
+import torchaudio
 
 from riffusion.spectrogram_converter import SpectrogramConverter
 from riffusion.spectrogram_params import SpectrogramParams
@@ -33,7 +34,19 @@ class SpectrogramImageConverter:
         Returns:
             Spectrogram image (in pillow format)
         """
-        assert int(segment.frame_rate) == self.p.sample_rate, "Sample rate mismatch"
+
+        # assert int(segment.frame_rate) == self.p.sample_rate, "Sample rate mismatch"
+
+        # TODO add resampling
+        if int(segment.frame_rate) != self.p.sample_rate:
+            print(f"Resampling from {segment.frame_rate}Hz to {self.p.sample_rate}Hz")
+            segment = segment.set_frame_rate(self.p.sample_rate)
+
+        # audio, sr = torchaudio.load(segment.filename)
+        # print(f"Loaded audio from {sr}Hz")
+
+        # audio = torchaudio.functional.resample(audio, sr, self.p.sample_rate)
+        # torchaudio.save(segment.filename, audio, self.p.sample_rate)
 
         if self.p.stereo:
             if segment.channels == 1:

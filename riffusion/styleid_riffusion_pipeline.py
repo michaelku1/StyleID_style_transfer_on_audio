@@ -46,7 +46,7 @@ def adain(content_feat, style_feat):
     output = ((content_feat - content_mean) / content_std) * style_std + style_mean
     return output
 
-
+# NOTE performing style injection at specified layers
 def feat_merge(content_feats, style_feats, start_step=0, gamma=0.75, T=1.5):
     """
     Merge content and style features for StyleID injection.
@@ -151,9 +151,10 @@ class StyleIDRiffusionPipeline(RiffusionPipeline):
             if 'attn' in name and 'to_q' in name:
                 module.register_forward_hook(lambda m, i, o, name=name: attention_hook(m, i, o, name))
 
+    # NOTE DDIM inversion
     def extract_features_ddim(self, image, num_steps=50, save_feature_steps=50):
         """
-        Extract features using DDIM inversion.
+        Extract features using DDIM inversion with memory optimization.
         
         Args:
             image: Input image (content or style)
@@ -200,29 +201,60 @@ class StyleIDRiffusionPipeline(RiffusionPipeline):
         latents = init_latents.clone()
         features = []
         
-        for i, t in enumerate(self.scheduler.timesteps):
-            if i >= num_steps:
-                break
+        # Memory optimization: Process in smaller chunks if needed
+        chunk_size = min(num_steps, 10)  # Process 10 steps at a time
+        
+        for chunk_start in range(0, num_steps, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, num_steps)
+            
+            for i in range(chunk_start, chunk_end):
+                if i >= len(self.scheduler.timesteps):
+                    break
+                    
+                t = self.scheduler.timesteps[i]
                 
-            # Predict noise - we need to provide encoder hidden states
-            # For DDIM inversion, we can use a dummy embedding or skip the cross-attention
-            # Let's create a dummy embedding with the correct shape
-            batch_size = latents.shape[0]
-            dummy_embedding = torch.zeros(batch_size, 77, 768, device=latents.device, dtype=latents.dtype)
-            noise_pred = self.unet(latents, t, encoder_hidden_states=dummy_embedding).sample
+                # Predict noise - we need to provide encoder hidden states
+                # For DDIM inversion, we can use a dummy embedding or skip the cross-attention
+                # Let's create a dummy embedding with the correct shape
+                batch_size = latents.shape[0]
+                dummy_embedding = torch.zeros(batch_size, 77, 768, device=latents.device, dtype=latents.dtype)
+                
+                # Use torch.no_grad() for memory efficiency
+                # BUG: is the style injected unet used correctly?
+                with torch.no_grad():
+                    noise_pred = self.unet(latents, t, encoder_hidden_states=dummy_embedding).sample
+                
+                # DDIM step
+                alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                alpha_prod_t_prev = self.scheduler.alphas_cumprod[t-1] if t > 0 else torch.tensor(1.0)
+                
+                # DDIM formula
+                pred_x0 = (latents - torch.sqrt(1 - alpha_prod_t) * noise_pred) / torch.sqrt(alpha_prod_t)
+                pred_dir_xt = torch.sqrt(1 - alpha_prod_t_prev) * noise_pred
+                latents = torch.sqrt(alpha_prod_t_prev) * pred_x0 + pred_dir_xt
+                
+                # Save features at specified steps
+                if i < save_feature_steps:
+                    # Use shallow copy to save memory
+                    if i < len(self.feat_maps):
+                        feature_copy = {}
+                        for key, value in self.feat_maps[i].items():
+                            if isinstance(value, torch.Tensor):
+                                feature_copy[key] = value.detach().cpu()  # Move to CPU to save GPU memory
+                            else:
+                                feature_copy[key] = value
+                        features.append(feature_copy)
+                    else:
+                        features.append({})
+                
+                # Clear intermediate tensors to save memory
+                del noise_pred, pred_x0, pred_dir_xt
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
-            # DDIM step
-            alpha_prod_t = self.scheduler.alphas_cumprod[t]
-            alpha_prod_t_prev = self.scheduler.alphas_cumprod[t-1] if t > 0 else torch.tensor(1.0)
-            
-            # DDIM formula
-            pred_x0 = (latents - torch.sqrt(1 - alpha_prod_t) * noise_pred) / torch.sqrt(alpha_prod_t)
-            pred_dir_xt = torch.sqrt(1 - alpha_prod_t_prev) * noise_pred
-            latents = torch.sqrt(alpha_prod_t_prev) * pred_x0 + pred_dir_xt
-            
-            # Save features at specified steps
-            if i < save_feature_steps:
-                features.append(copy.deepcopy(self.feat_maps[i]) if i < len(self.feat_maps) else {})
+            # Clear memory after each chunk
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         return latents, features
 
@@ -268,13 +300,14 @@ class StyleIDRiffusionPipeline(RiffusionPipeline):
             generator_start = torch.Generator(device=self.device).manual_seed(start.seed)
             generator_end = torch.Generator(device=self.device).manual_seed(end.seed)
 
-        # Text encodings with interpolation
+        ############### Text encodings with interpolation ###############
         embed_start = self.embed_text_weighted(start.prompt)
         embed_end = self.embed_text_weighted(end.prompt)
         text_embedding = embed_start + alpha * (embed_end - embed_start)
 
         # Extract content and style features
         print("Extracting content features...")
+        # NOTE DDIM inversion, therefore using default unet
         content_latents, content_features = self.extract_features_ddim(
             content_image, 
             num_steps=inputs.num_inference_steps,
@@ -282,19 +315,20 @@ class StyleIDRiffusionPipeline(RiffusionPipeline):
         )
         
         print("Extracting style features...")
+        # NOTE DDIM inversion, therefore using default unet
         style_latents, style_features = self.extract_features_ddim(
             style_image,
             num_steps=inputs.num_inference_steps, 
             save_feature_steps=inputs.num_inference_steps
         )
 
-        # AdaIN initialization
+        ############### AdaIN initialization ###############
         if use_adain_init:
             init_latents = adain(content_latents, style_latents)
         else:
             init_latents = content_latents
 
-        # Merge features for injection
+        ############### Merge features for injection ###############
         if use_attn_injection:
             feat_maps = feat_merge(
                 content_features, 
@@ -307,6 +341,7 @@ class StyleIDRiffusionPipeline(RiffusionPipeline):
             feat_maps = None
 
         # Run StyleID-enhanced interpolation
+        # NOTE uses styleid unet
         outputs = self.styleid_interpolate_img2img(
             text_embeddings=text_embedding,
             init_latents=init_latents,
@@ -395,6 +430,7 @@ class StyleIDRiffusionPipeline(RiffusionPipeline):
             [timesteps] * batch_size * num_images_per_prompt, device=self.device
         )
 
+        # NOTE initialise style and content latents
         # Add noise to latents
         noise_a = torch.randn(
             init_latents.shape, generator=generator_a, device=self.device, dtype=latents_dtype
@@ -416,6 +452,8 @@ class StyleIDRiffusionPipeline(RiffusionPipeline):
         t_start = max(num_inference_steps - init_timestep + offset, 0)
         timesteps = self.scheduler.timesteps[t_start:].to(self.device)
 
+        # NOTE start styleid interpolation:
+        # 1. get injected features for current timestep
         for i, t in enumerate(self.progress_bar(timesteps)):
             # Get injected features for current timestep
             injected_features_i = None
@@ -433,6 +471,7 @@ class StyleIDRiffusionPipeline(RiffusionPipeline):
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
             # Predict noise with StyleID injection
+            # unet usage: self.unet(x, t, encoder_hidden_states=encoder_hidden_states)
             noise_pred = self.unet_with_styleid(
                 latent_model_input, 
                 t, 
@@ -468,7 +507,8 @@ class StyleIDRiffusionPipeline(RiffusionPipeline):
             image = self.numpy_to_pil(image)
 
         return dict(images=image, latents=latents, nsfw_content_detected=False)
-
+    
+    # NOTE
     def unet_with_styleid(self, x, t, encoder_hidden_states, injected_features=None):
         """
         UNet forward pass with StyleID attention feature injection.

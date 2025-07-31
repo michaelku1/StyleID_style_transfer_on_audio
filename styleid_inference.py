@@ -19,16 +19,33 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 import copy
 import time
+import gc
 
 from riffusion.datatypes import InferenceInput, PromptInput
 from riffusion.spectrogram_converter import SpectrogramConverter
 from riffusion.spectrogram_image_converter import SpectrogramImageConverter
 from riffusion.spectrogram_params import SpectrogramParams
 from riffusion.util import torch_util
-from riffusion.riffusion_pipeline import RiffusionPipeline
 
 # StyleID imports
-from riffusion.styleid_riffusion_pipeline import StyleIDRiffusionPipeline, adain, feat_merge
+from riffusion.styleid_riffusion_pipeline import StyleIDRiffusionPipeline
+
+
+def clear_memory():
+    """Clear GPU and CPU memory."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+
+
+def get_memory_usage():
+    """Get current GPU memory usage in GB."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        return allocated, reserved
+    return 0, 0
 
 
 class StyleIDRiffusionInference:
@@ -41,7 +58,8 @@ class StyleIDRiffusionInference:
         model_path: str = "riffusion/riffusion-model-v1",
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
-        styleid_params: Optional[Dict] = None
+        styleid_params: Optional[Dict] = None,
+        enable_memory_optimization: bool = True
     ):
         """
         Initialize the StyleID Riffusion inference pipeline.
@@ -51,9 +69,20 @@ class StyleIDRiffusionInference:
             device: Device to run inference on
             dtype: Data type for model weights
             styleid_params: StyleID parameters (gamma, T, start_step, etc.)
+            enable_memory_optimization: Whether to enable memory optimization features
         """
         self.device = torch_util.check_device(device)
         self.dtype = dtype
+        self.enable_memory_optimization = enable_memory_optimization
+        
+        # Memory optimization settings
+        if self.enable_memory_optimization:
+            # Set PyTorch memory allocation settings
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+            
+            # Enable gradient checkpointing for memory efficiency
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
         
         # Default StyleID parameters
         self.styleid_params = {
@@ -69,6 +98,9 @@ class StyleIDRiffusionInference:
         
         # Load the model
         print(f"Loading Riffusion model from {model_path}...")
+        print(f"Memory before loading: {get_memory_usage()[0]:.2f} GB allocated")
+        
+        # NOTE using default (UNet2DConditionModel)
         self.pipeline = StyleIDRiffusionPipeline.load_checkpoint(
             checkpoint=model_path,
             device=self.device,
@@ -76,12 +108,23 @@ class StyleIDRiffusionInference:
             use_traced_unet=True
         )
         
+        # Apply memory optimizations
+        if self.enable_memory_optimization:
+            self.pipeline.unet.eval()
+            self.pipeline.vae.eval()
+            self.pipeline.text_encoder.eval()
+            
+            # Enable gradient checkpointing for UNet
+            if hasattr(self.pipeline.unet, 'enable_gradient_checkpointing'):
+                self.pipeline.unet.enable_gradient_checkpointing()
+        
         # Initialize spectrogram converters
         params = SpectrogramParams()
         self.spectrogram_converter = SpectrogramConverter(params=params, device=self.device)
         self.image_converter = SpectrogramImageConverter(params=params, device=self.device)
         
         print(f"Model loaded successfully on {self.device}")
+        print(f"Memory after loading: {get_memory_usage()[0]:.2f} GB allocated")
     
     def audio_to_spectrogram(self, audio_path: str) -> Image.Image:
         """
@@ -98,6 +141,7 @@ class StyleIDRiffusionInference:
         # Load audio using pydub
         import pydub
         audio_segment = pydub.AudioSegment.from_file(audio_path)
+
         
         # Convert audio to spectrogram image
         image = self.image_converter.spectrogram_image_from_audio(audio_segment)
@@ -126,7 +170,7 @@ class StyleIDRiffusionInference:
         num_steps: int = 50
     ) -> Tuple[torch.Tensor, List[Dict]]:
         """
-        Extract features using DDIM inversion.
+        Extract features using DDIM inversion with memory optimization.
         
         Args:
             image: Input spectrogram image
@@ -137,15 +181,25 @@ class StyleIDRiffusionInference:
         """
         print(f"Extracting features using DDIM inversion ({num_steps} steps)...")
         
+        # Clear memory before feature extraction
+        if self.enable_memory_optimization:
+            clear_memory()
+            print(f"Memory before feature extraction: {get_memory_usage()[0]:.2f} GB allocated")
+        
         # Setup feature extraction
         self.pipeline.setup_feature_extraction()
         
-        # Extract features
-        latents, features = self.pipeline.extract_features_ddim(
-            image=image,
-            num_steps=num_steps,
-            save_feature_steps=num_steps
-        )
+        # NOTE Extract features + DDIM sampling with memory monitoring
+        with torch.no_grad():
+            latents, features = self.pipeline.extract_features_ddim(
+                image=image,
+                num_steps=num_steps,
+                save_feature_steps=num_steps
+            )
+        
+        if self.enable_memory_optimization:
+            print(f"Memory after feature extraction: {get_memory_usage()[0]:.2f} GB allocated")
+            clear_memory()
         
         return latents, features
     
@@ -163,7 +217,7 @@ class StyleIDRiffusionInference:
         seed: int = 42
     ) -> Image.Image:
         """
-        Perform StyleID-enhanced audio style transfer.
+        Perform StyleID-enhanced audio style transfer with memory optimization.
         
         Args:
             content_audio_path: Path to content audio file
@@ -184,21 +238,45 @@ class StyleIDRiffusionInference:
         print("STYLEID RIFFUSION AUDIO STYLE TRANSFER")
         print("=" * 60)
         
+        # Initial memory check
+        if self.enable_memory_optimization:
+            allocated, reserved = get_memory_usage()
+            print(f"Initial memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+        
         # Step 1: Convert audio to spectrograms
         print("\nStep 1: Converting audio to spectrograms...")
         content_image = self.audio_to_spectrogram(content_audio_path)
         style_image = self.audio_to_spectrogram(style_audio_path)
         
+        if self.enable_memory_optimization:
+            clear_memory()
+            allocated, reserved = get_memory_usage()
+            print(f"Memory after spectrogram conversion: {allocated:.2f} GB allocated")
+        
         # Step 2: Extract features using DDIM inversion
         print("\nStep 2: Extracting content features...")
+
+        # NOTE extract features and perform DDIM inversion
         content_latents, content_features = self.extract_features_ddim(
             content_image, num_steps=num_inference_steps
         )
         
+        # Clear memory between extractions
+        if self.enable_memory_optimization:
+            clear_memory()
+            del content_latents  # Free memory immediately
+        
         print("Extracting style features...")
+
+        # NOTE extract feature and perform DDIM inversion
         style_latents, style_features = self.extract_features_ddim(
             style_image, num_steps=num_inference_steps
         )
+        
+        # Clear memory after both extractions
+        if self.enable_memory_optimization:
+            clear_memory()
+            del style_latents  # Free memory immediately
         
         # Step 3: Prepare inference inputs
         print("\nStep 3: Preparing inference parameters...")
@@ -223,20 +301,34 @@ class StyleIDRiffusionInference:
         print("\nStep 4: Performing StyleID-enhanced generation...")
         start_time = time.time()
         
-        stylized_image = self.pipeline.styleid_riffuse(
-            inputs=inputs,
-            content_image=content_image,
-            style_image=style_image,
-            use_adain_init=self.styleid_params['use_adain_init'],
-            use_attn_injection=self.styleid_params['use_attn_injection'],
-            gamma=self.styleid_params['gamma'],
-            T=self.styleid_params['T'],
-            start_step=self.styleid_params['start_step']
-        )
+        if self.enable_memory_optimization:
+            allocated, reserved = get_memory_usage()
+            print(f"Memory before generation: {allocated:.2f} GB allocated")
+        
+        # NOTE where style injection happens
+        with torch.no_grad():
+            stylized_image = self.pipeline.styleid_riffuse(
+                inputs=inputs,
+                content_image=content_image,
+                style_image=style_image,
+                use_adain_init=self.styleid_params['use_adain_init'],
+                use_attn_injection=self.styleid_params['use_attn_injection'],
+                gamma=self.styleid_params['gamma'],
+                T=self.styleid_params['T'],
+                start_step=self.styleid_params['start_step']
+            )
         
         generation_time = time.time() - start_time
         print(f"Generation completed in {generation_time:.2f} seconds")
         
+        # Clear memory after generation
+        if self.enable_memory_optimization:
+            clear_memory()
+            allocated, reserved = get_memory_usage()
+            print(f"Memory after generation: {allocated:.2f} GB allocated")
+        
+
+
         # Step 5: Convert back to audio
         print("\nStep 5: Converting to audio...")
         self.spectrogram_to_audio(stylized_image, output_path)
@@ -254,7 +346,7 @@ class StyleIDRiffusionInference:
         **kwargs
     ):
         """
-        Perform batch style transfer on multiple audio files.
+        Perform batch style transfer on multiple audio files with memory optimization.
         
         Args:
             content_dir: Directory containing content audio files
@@ -289,6 +381,10 @@ class StyleIDRiffusionInference:
                 print(f"Style: {style_name}")
                 
                 try:
+                    # Clear memory before each processing
+                    if self.enable_memory_optimization:
+                        clear_memory()
+                    
                     self.style_transfer(
                         content_audio_path=content_file,
                         style_audio_path=style_file,
@@ -297,6 +393,9 @@ class StyleIDRiffusionInference:
                     )
                 except Exception as e:
                     print(f"Error processing {content_file} with {style_file}: {e}")
+                    # Clear memory on error
+                    if self.enable_memory_optimization:
+                        clear_memory()
                     continue
 
 
@@ -310,6 +409,8 @@ def main():
     parser.add_argument("--device", default="cuda", help="Device to run inference on")
     parser.add_argument("--dtype", default="float16", choices=["float16", "float32"], 
                        help="Data type for model weights")
+    parser.add_argument("--disable_memory_optimization", action="store_true",
+                       help="Disable memory optimization features")
     
     # Input/Output paths
     parser.add_argument("--content_audio", required=True, help="Path to content audio file")
@@ -317,6 +418,7 @@ def main():
     parser.add_argument("--output_path", required=True, help="Path to save output audio")
     
     # StyleID parameters
+    # NOTE gamma for content, (1-gamma) for style
     parser.add_argument("--gamma", type=float, default=0.75, 
                        help="Query preservation parameter (0-1)")
     parser.add_argument("--T", type=float, default=1.5, 
@@ -329,9 +431,9 @@ def main():
                        help="Disable attention feature injection")
     
     # Generation parameters
-    parser.add_argument("--prompt_start", default="electronic music", 
+    parser.add_argument("--prompt_start", default="", 
                        help="Starting text prompt")
-    parser.add_argument("--prompt_end", default="electronic music", 
+    parser.add_argument("--prompt_end", default="", 
                        help="Ending text prompt")
     parser.add_argument("--alpha", type=float, default=0.5, 
                        help="Interpolation parameter (0-1)")
@@ -364,13 +466,34 @@ def main():
         'use_adain_init': not args.no_adain_init,
         'use_attn_injection': not args.no_attn_injection
     }
+
+
+    # print argparse parameters 
+    print('-' * 60)
+    print('Argparse parameters:')
+    print(f"Model path: {args.model_path}")
+    print(f"Device: {args.device}")
+    print(f"Data type: {args.dtype}")
+    print(f"Disable memory optimization: {args.disable_memory_optimization}")
+    print(f"Content audio: {args.content_audio}")
+    print(f"Style audio: {args.style_audio}")
+    print(f"Prompt start: {args.prompt_start}")
+    print(f"Prompt end: {args.prompt_end}")
+    print(f"Alpha: {args.alpha}")
+    print(f"Num inference steps: {args.num_inference_steps}")
+    print(f"Guidance scale: {args.guidance_scale}")
+    print(f"Denoising strength: {args.denoising_strength}")
+    print(f"Seed: {args.seed}")
+    print(f"Output path: {args.output_path}")
+    print('-' * 60)
     
     # Initialize inference pipeline
     inference = StyleIDRiffusionInference(
         model_path=args.model_path,
         device=args.device,
         dtype=dtype,
-        styleid_params=styleid_params
+        styleid_params=styleid_params,
+        enable_memory_optimization=not args.disable_memory_optimization
     )
     
     if args.batch_mode:

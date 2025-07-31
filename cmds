@@ -1,0 +1,24 @@
+# run styleid inference on vocal to EGDB
+CUDA_VISIBLE_DEVICES=1 python3 styleid_inference.py --content_audio /mnt/gestalt/home/mku666/wah_emulation/EGDB_DI/233.wav --style_audio /mnt/gestalt/home/mku666/vocal2guitar/vocals/233_sinsy.wav --output_path ./output.wav --prompt_start "" --prompt_end ""
+
+# run styleid inference on MusicTI dataset
+CUDA_VISIBLE_DEVICES=1 python3 styleid_inference.py --content_audio /mnt/gestalt/home/mku666/musicTI_audios/content/piano/piano1.wav --style_audio /mnt/gestalt/home/mku666/musicTI_audios/timbre/accordion/accordion1.wav --output_path ./results/musicTI_piano_accordion_test.wav --prompt_start "" --prompt_end ""
+
+# visualize patch embedding overlaying on attention heatmap of riffusion
+CUDA_VISIBLE_DEVICES=1 python3 riffusion_heatmap_patch_visualiztion.py --audio_path /mnt/gestalt/home/mku666/musicTI_audios/content/piano/piano1.wav --time_step 5 --attention_layer 6 --query_token 33 --num_inference_steps 30
+
+# visualize attention heatmap of riffusion
+python riffusion_activation_visualization.py \
+    --audio_path /mnt/gestalt/home/mku666/musicTI_audios/content/piano/piano1.wav \
+    --time_step 20 \
+    --attention_layer "6,7,8,9,10,11" \
+    --head 0 \
+    --prompt "electronic beats" \
+    --num_inference_steps 30 \
+    --seed 42
+
+
+# MusicTI content -> MusicTI content
+
+# Music TI timbre -> MusicTI content
+
